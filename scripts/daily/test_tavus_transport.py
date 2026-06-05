@@ -1,9 +1,7 @@
 import asyncio
 import base64
-import datetime
 import os
 import signal
-import wave
 
 from daily import (
     CallClient,
@@ -49,7 +47,6 @@ class DailyProxyApp(EventHandler):
         # Raw PCM buffer — filled by app-message audio, drained at SAMPLE_RATE speed.
         self._buffer = bytearray()
         self._audio_task: asyncio.Task | None = None
-        self._wav_file: wave.Wave_write | None = None
 
         self._client: CallClient = CallClient(event_handler=self)
         self._client.update_subscription_profiles(
@@ -66,24 +63,8 @@ class DailyProxyApp(EventHandler):
             print(f"Unable to join meeting: {error}")
             self._loop.call_soon_threadsafe(self._loop.stop)
 
-    def _open_wav(self):
-        os.makedirs("recordings", exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = f"recordings/received_appmsg_{timestamp}.wav"
-        self._wav_file = wave.open(path, "wb")
-        self._wav_file.setnchannels(1)
-        self._wav_file.setsampwidth(2)
-        self._wav_file.setframerate(SAMPLE_RATE)
-        logger.info(f"Recording received audio to {path}")
-
-    def _close_wav(self):
-        if self._wav_file:
-            self._wav_file.close()
-            self._wav_file = None
-
     def run(self, meeting_url: str):
         asyncio.set_event_loop(self._loop)
-        self._open_wav()
         self._create_audio_task()
 
         def handle_exit():
@@ -116,7 +97,6 @@ class DailyProxyApp(EventHandler):
         if self._audio_task:
             self._loop.run_until_complete(self._cancel_audio_task())
 
-        self._close_wav()
         self._client.leave()
         self._client.release()
 
@@ -195,8 +175,6 @@ class DailyProxyApp(EventHandler):
         if event == "conversation.audio":
             try:
                 audio_bytes = base64.b64decode(message["data"])
-                if self._wav_file:
-                    self._wav_file.writeframes(audio_bytes)
                 asyncio.run_coroutine_threadsafe(self._buffer_audio(audio_bytes), self._loop)
             except Exception as e:
                 logger.error(f"Error decoding audio message: {e}")
