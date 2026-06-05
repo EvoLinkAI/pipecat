@@ -37,9 +37,6 @@ from pipecat.services.ai_service import AIService
 from pipecat.services.settings import ServiceSettings
 from pipecat.transports.tavus.transport import (
     AVATAR_VAD_STOP_SECS,
-    TAVUS_AUDIO_CHUNK_BYTES,
-    TAVUS_DONE_SILENCE_BYTES,
-    TAVUS_SAMPLE_RATE,
     TavusCallbacks,
     TavusParams,
     TavusTransportClient,
@@ -293,10 +290,13 @@ class TavusVideoService(AIService):
         """Accumulate audio into chunks and send via conversation.echo.
 
         Tracks inference_id from the first TTSAudioRawFrame of each utterance.
-        Accumulates resampled audio until TAVUS_AUDIO_CHUNK_BYTES is reached,
-        then sends with done=False. On AVATAR_VAD_STOP_SECS timeout, flushes any
-        remainder and sends a done=True silence to signal end of utterance.
+        Accumulates resampled audio until 400ms is reached, then sends with done=False.
+        On AVATAR_VAD_STOP_SECS timeout, flushes any remainder and sends a done=True
+        silence to signal end of utterance.
         """
+        sample_rate = self._client.out_sample_rate
+        audio_chunk_bytes = int(sample_rate * 2 * 0.4)  # 400ms, 16-bit mono
+        done_silence = bytes(int(sample_rate * 2 / 20))  # 50ms silence for done signal
         audio_buffer = bytearray()
         inference_id: str | None = None
         while True:
@@ -305,12 +305,12 @@ class TavusVideoService(AIService):
                 if inference_id is None:
                     inference_id = str(frame.id)
                 audio = await self._resampler.resample(
-                    frame.audio, frame.sample_rate, TAVUS_SAMPLE_RATE
+                    frame.audio, frame.sample_rate, sample_rate
                 )
                 audio_buffer.extend(audio)
-                while len(audio_buffer) >= TAVUS_AUDIO_CHUNK_BYTES:
-                    send_chunk = bytes(audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES])
-                    del audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES]
+                while len(audio_buffer) >= audio_chunk_bytes:
+                    send_chunk = bytes(audio_buffer[:audio_chunk_bytes])
+                    del audio_buffer[:audio_chunk_bytes]
                     await self._client.encode_audio_and_send(send_chunk, False, inference_id)
                 self._queue.task_done()
             except TimeoutError:
@@ -322,6 +322,5 @@ class TavusVideoService(AIService):
                         bytes(audio_buffer), False, inference_id
                     )
                     audio_buffer.clear()
-                silence = bytes(TAVUS_DONE_SILENCE_BYTES)
-                await self._client.encode_audio_and_send(silence, True, inference_id)
+                await self._client.encode_audio_and_send(done_silence, True, inference_id)
                 inference_id = None

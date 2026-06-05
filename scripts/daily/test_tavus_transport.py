@@ -15,10 +15,6 @@ from loguru import logger
 
 load_dotenv(override=True)
 
-SAMPLE_RATE = 24000
-CHUNK_BYTES = int(SAMPLE_RATE * 20 / 1000) * 2  # 20ms, 16-bit mono
-MIN_AUDIO_BUFFER = CHUNK_BYTES * 5  # 100ms pre-buffer
-
 
 def completion_callback(future):
     def _callback(*args):
@@ -44,20 +40,22 @@ class DailyProxyApp(EventHandler):
     def __init__(self):
         super().__init__()
         self._loop = asyncio.new_event_loop()
-        # Raw PCM buffer — filled by app-message audio, drained at SAMPLE_RATE speed.
+        # Raw PCM buffer — filled by app-message audio, drained at received sample rate.
         self._buffer = bytearray()
         self._audio_task: asyncio.Task | None = None
         self._msg_count = 0
         self._msg_bytes = 0
 
+        # Initialized lazily on the first audio message so the sample rate matches
+        # what the server actually sends.
+        self._sample_rate: int | None = None
+        self._audio_source: CustomAudioSource | None = None
+        self._audio_track: CustomAudioTrack | None = None
+
         self._client: CallClient = CallClient(event_handler=self)
         self._client.update_subscription_profiles(
             {"base": {"camera": "unsubscribed", "microphone": "unsubscribed"}}
         )
-
-        # Playback source at SAMPLE_RATE — consumes audio at real-time speed.
-        self._audio_source = CustomAudioSource(SAMPLE_RATE, 1, False)
-        self._audio_track = CustomAudioTrack(self._audio_source)
 
     def on_joined(self, data, error):
         logger.debug("Local participant Joined!")
@@ -77,18 +75,7 @@ class DailyProxyApp(EventHandler):
             self._loop.add_signal_handler(sig, handle_exit)
 
         self._client.set_user_name("TestTavusTransport")
-        self._client.join(
-            meeting_url,
-            completion=self.on_joined,
-            client_settings={
-                "inputs": {
-                    "microphone": {
-                        "isEnabled": True,
-                        "settings": {"customTrack": {"id": self._audio_track.id}},
-                    },
-                }
-            },
-        )
+        self._client.join(meeting_url, completion=self.on_joined)
 
         try:
             self._loop.run_forever()
@@ -115,40 +102,71 @@ class DailyProxyApp(EventHandler):
                 pass
             self._audio_task = None
 
-    async def _buffer_audio(self, data: bytes):
-        """Append decoded audio bytes to the buffer."""
+    async def _maybe_init_audio_source(self, sample_rate: int):
+        """Create CustomAudioSource at the server's sample rate and publish it."""
+        if self._audio_source is not None:
+            return
+        self._sample_rate = sample_rate
+        self._audio_source = CustomAudioSource(sample_rate, 1, False)
+        self._audio_track = CustomAudioTrack(self._audio_source)
+        future = asyncio.get_running_loop().create_future()
+        self._client.update_inputs(
+            {
+                "microphone": {
+                    "isEnabled": True,
+                    "settings": {"customTrack": {"id": self._audio_track.id}},
+                }
+            },
+            completion=completion_callback(future),
+        )
+        await future
+        logger.info(f"Audio source initialized at {sample_rate}Hz")
+
+    async def _buffer_audio(self, data: bytes, sample_rate: int):
+        """Initialize the audio source if needed, then append bytes to the buffer."""
+        await self._maybe_init_audio_source(sample_rate)
         self._buffer.extend(data)
 
     async def _handle_interrupt(self):
         """Clear the audio buffer, mimicking the avatar stopping mid-speech."""
         dropped = len(self._buffer)
         self._buffer.clear()
-        logger.info(
-            f"Interrupt received — dropped {dropped}B ({dropped / (SAMPLE_RATE * 2):.3f}s) from buffer"
-        )
+        if self._sample_rate:
+            logger.info(
+                f"Interrupt received — dropped {dropped}B "
+                f"({dropped / (self._sample_rate * 2):.3f}s) from buffer"
+            )
 
     async def _audio_task_handler(self):
-        """Drain the buffer at SAMPLE_RATE speed (real-time playback).
+        """Drain the buffer at the received sample rate (real-time playback).
 
-        Waits until MIN_AUDIO_BUFFER bytes are accumulated before starting
-        playback, then drains in CHUNK_BYTES steps. If the buffer runs dry it
-        re-enters the waiting state so the next burst also gets the pre-buffer delay.
+        Waits for the audio source to be initialized, then waits until 100ms of audio
+        is accumulated before starting playback. Drains in 20ms steps. If the buffer
+        runs dry it re-enters the waiting state.
         """
         buffering = True
         last_log_time = self._loop.time()
 
         while True:
+            if self._audio_source is None or self._sample_rate is None:
+                await asyncio.sleep(0.01)
+                last_log_time = self._loop.time()
+                continue
+
+            chunk_bytes = int(self._sample_rate * 20 / 1000) * 2  # 20ms, 16-bit mono
+            min_audio_buffer = chunk_bytes * 5  # 100ms pre-buffer
+
             if buffering:
-                if len(self._buffer) >= MIN_AUDIO_BUFFER:
+                if len(self._buffer) >= min_audio_buffer:
                     buffering = False
-                    logger.debug(f"Pre-buffer reached ({MIN_AUDIO_BUFFER}B) — starting playback")
+                    logger.debug(f"Pre-buffer reached ({min_audio_buffer}B) — starting playback")
                 else:
                     await asyncio.sleep(0.001)
                     continue
 
-            if len(self._buffer) >= CHUNK_BYTES:
-                chunk = bytes(self._buffer[:CHUNK_BYTES])
-                del self._buffer[:CHUNK_BYTES]
+            if len(self._buffer) >= chunk_bytes:
+                chunk = bytes(self._buffer[:chunk_bytes])
+                del self._buffer[:chunk_bytes]
 
                 future = asyncio.get_running_loop().create_future()
                 self._audio_source.write_frames(chunk, completion=completion_callback(future))
@@ -159,7 +177,7 @@ class DailyProxyApp(EventHandler):
 
             now = self._loop.time()
             if now - last_log_time >= 1.0:
-                buffer_seconds = len(self._buffer) / (SAMPLE_RATE * 2)
+                buffer_seconds = len(self._buffer) / (self._sample_rate * 2)
                 logger.info(
                     f"msgs/s: {self._msg_count} | "
                     f"KB/s: {self._msg_bytes / 1024:.1f} | "
@@ -183,10 +201,13 @@ class DailyProxyApp(EventHandler):
                 return
             try:
                 audio_bytes = base64.b64decode(props["audio"])
+                sample_rate = props["sample_rate"]
                 self._msg_count += 1
                 self._msg_bytes += len(audio_bytes)
                 done = props.get("done", False)
-                asyncio.run_coroutine_threadsafe(self._buffer_audio(audio_bytes), self._loop)
+                asyncio.run_coroutine_threadsafe(
+                    self._buffer_audio(audio_bytes, sample_rate), self._loop
+                )
                 if done:
                     logger.debug(f"inference {props.get('inference_id')} done")
             except Exception as e:

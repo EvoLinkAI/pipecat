@@ -48,9 +48,6 @@ from pipecat.transports.daily.transport import (
     DailyTransportClient,
 )
 
-TAVUS_SAMPLE_RATE = 24000
-TAVUS_AUDIO_CHUNK_BYTES = int(TAVUS_SAMPLE_RATE * 2 * 0.4)  # 400ms, 16-bit mono
-TAVUS_DONE_SILENCE_BYTES = int(TAVUS_SAMPLE_RATE * 2 / 20)  # 50ms silence for done signal
 AVATAR_VAD_STOP_SECS = 0.35
 
 
@@ -414,7 +411,7 @@ class TavusTransportClient:
         """Base64-encode audio bytes and send as a conversation.echo app message.
 
         Args:
-            audio: Raw PCM bytes at TAVUS_SAMPLE_RATE, 16-bit mono.
+            audio: Raw PCM bytes at the client output sample rate, 16-bit mono.
             done: True when this is the final chunk for the current inference.
             inference_id: Identifier tying all chunks of one utterance together.
         """
@@ -429,7 +426,7 @@ class TavusTransportClient:
                     "inference_id": inference_id,
                     "audio": audio_base64,
                     "done": done,
-                    "sample_rate": TAVUS_SAMPLE_RATE,
+                    "sample_rate": self.out_sample_rate,
                 },
             }
         )
@@ -727,10 +724,13 @@ class TavusOutputTransport(BaseOutputTransport):
     async def _send_task_handler(self):
         """Drain the audio queue, accumulate into chunks, and send via conversation.echo.
 
-        Accumulates frames until TAVUS_AUDIO_CHUNK_BYTES is reached, then sends with
+        Accumulates frames until 400ms worth of audio is reached, then sends with
         done=False. On AVATAR_VAD_STOP_SECS timeout (end of speech), flushes any
         remainder and sends a done=True silence to signal the utterance is complete.
         """
+        sample_rate = self._client.out_sample_rate
+        audio_chunk_bytes = int(sample_rate * 2 * 0.4)  # 400ms, 16-bit mono
+        done_silence = bytes(int(sample_rate * 2 / 20))  # 50ms silence for done signal
         audio_buffer = bytearray()
         while True:
             try:
@@ -738,14 +738,14 @@ class TavusOutputTransport(BaseOutputTransport):
                     self._audio_queue.get(), timeout=AVATAR_VAD_STOP_SECS
                 )
                 audio = frame.audio
-                if frame.sample_rate != TAVUS_SAMPLE_RATE:
+                if frame.sample_rate != sample_rate:
                     audio = await self._resampler.resample(
-                        audio, frame.sample_rate, TAVUS_SAMPLE_RATE
+                        audio, frame.sample_rate, sample_rate
                     )
                 audio_buffer.extend(audio)
-                while len(audio_buffer) >= TAVUS_AUDIO_CHUNK_BYTES:
-                    chunk = bytes(audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES])
-                    del audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES]
+                while len(audio_buffer) >= audio_chunk_bytes:
+                    chunk = bytes(audio_buffer[:audio_chunk_bytes])
+                    del audio_buffer[:audio_chunk_bytes]
                     await self._client.encode_audio_and_send(chunk, False, self._inference_id)
                 self._audio_queue.task_done()
             except TimeoutError:
@@ -754,8 +754,7 @@ class TavusOutputTransport(BaseOutputTransport):
                         bytes(audio_buffer), False, self._inference_id
                     )
                     audio_buffer.clear()
-                silence = bytes(TAVUS_DONE_SILENCE_BYTES)
-                await self._client.encode_audio_and_send(silence, True, self._inference_id)
+                await self._client.encode_audio_and_send(done_silence, True, self._inference_id)
                 self._inference_id = None
 
 
