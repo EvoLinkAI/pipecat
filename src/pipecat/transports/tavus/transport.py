@@ -185,7 +185,7 @@ class TavusTransportClient:
         callbacks: TavusCallbacks,
         api_key: str,
         replica_id: str,
-        persona_id: str = "pipecat0", # test with pipecat0
+        persona_id: str = "pipecat0",  # test with pipecat0
         session: aiohttp.ClientSession,
     ) -> None:
         """Initialize the Tavus transport client.
