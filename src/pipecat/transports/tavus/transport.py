@@ -446,20 +446,6 @@ class TavusTransportClient:
             participant_settings=participant_settings, profile_settings=profile_settings
         )
 
-    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Write an audio frame to the transport.
-
-        Args:
-            frame: The audio frame to write.
-
-        Returns:
-            True if the audio frame was written successfully, False otherwise.
-        """
-        if not self._client:
-            return False
-
-        return await self._client.write_audio_frame(frame)
-
     async def register_audio_destination(self, destination: str, auto_silence: bool | None = True):
         """Register an audio destination for output.
 
@@ -624,8 +610,14 @@ class TavusOutputTransport(BaseOutputTransport):
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         """Intercept BotStartedSpeakingFrame to capture the inference ID."""
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, BotStartedSpeakingFrame):
-            self._inference_id = str(frame.id)
+        # The BotStartedSpeakingFrame and BotStoppedSpeakingFrame are created inside BaseOutputTransport
+        # so TavusOutputTransport never receives these frames.
+        # This is a workaround, so we can more reliably be aware when the bot has started or stopped speaking
+        if direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, BotStartedSpeakingFrame):
+                if self._inference_id is not None:
+                    logger.warning("TavusOutputTransport self._current_idx_str is already defined!")
+                self._inference_id = str(frame.id)
         await super().push_frame(frame, direction)
 
     async def start(self, frame: StartFrame):
@@ -749,6 +741,9 @@ class TavusOutputTransport(BaseOutputTransport):
                     await self._client.encode_audio_and_send(chunk, False, self._inference_id)
                 self._audio_queue.task_done()
             except TimeoutError:
+                if not self._inference_id:
+                    # nothing to do here, we're waiting for the first audio frame
+                    continue
                 if audio_buffer:
                     await self._client.encode_audio_and_send(
                         bytes(audio_buffer), False, self._inference_id
