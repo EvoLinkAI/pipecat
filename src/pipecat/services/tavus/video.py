@@ -10,21 +10,18 @@ This module implements Tavus as a sink transport layer, providing video
 avatar functionality through Tavus's streaming API.
 """
 
-import asyncio
 from dataclasses import dataclass
 
 import aiohttp
 from daily.daily import AudioData, VideoFrame
 from loguru import logger
 
-from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     CancelFrame,
     EndFrame,
     Frame,
     InterruptionFrame,
-    OutputAudioRawFrame,
     OutputImageRawFrame,
     OutputTransportReadyFrame,
     SpeechOutputAudioRawFrame,
@@ -36,7 +33,6 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSet
 from pipecat.services.ai_service import AIService
 from pipecat.services.settings import ServiceSettings
 from pipecat.transports.tavus.transport import (
-    AVATAR_VAD_STOP_SECS,
     TavusCallbacks,
     TavusParams,
     TavusTransportClient,
@@ -99,9 +95,6 @@ class TavusVideoService(AIService):
 
         self._other_participant_has_joined = False
         self._client: TavusTransportClient | None = None
-
-        self._resampler = create_stream_resampler()
-        self._send_task: asyncio.Task | None = None
         self._transport_ready = False
 
     async def setup(self, setup: FrameProcessorSetup):
@@ -210,7 +203,7 @@ class TavusVideoService(AIService):
         """
         await super().start(frame)
         await self._client.start(frame)
-        await self._create_send_task()
+        await self._client.start_send_task()
 
     async def stop(self, frame: EndFrame):
         """Stop the Tavus video service.
@@ -220,7 +213,7 @@ class TavusVideoService(AIService):
         """
         await super().stop(frame)
         await self._end_conversation()
-        await self._cancel_send_task()
+        await self._client.cancel_send_task()
 
     async def cancel(self, frame: CancelFrame):
         """Cancel the Tavus video service.
@@ -230,7 +223,7 @@ class TavusVideoService(AIService):
         """
         await super().cancel(frame)
         await self._end_conversation()
-        await self._cancel_send_task()
+        await self._client.cancel_send_task()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames through the service.
@@ -245,7 +238,7 @@ class TavusVideoService(AIService):
             await self._handle_interruptions()
             await self.push_frame(frame, direction)
         elif isinstance(frame, TTSAudioRawFrame):
-            await self._handle_audio_frame(frame)
+            await self._client.queue_audio_frame(frame)
         elif isinstance(frame, OutputTransportReadyFrame):
             self._transport_ready = True
             await self.push_frame(frame, direction)
@@ -261,66 +254,11 @@ class TavusVideoService(AIService):
 
     async def _handle_interruptions(self):
         """Handle interruption events by resetting send tasks and notifying client."""
-        await self._cancel_send_task()
-        await self._create_send_task()
+        await self._client.cancel_send_task()
         await self._client.send_interrupt_message()
+        await self._client.start_send_task()
 
     async def _end_conversation(self):
         """End the current conversation and reset state."""
         await self._client.stop()
         self._other_participant_has_joined = False
-
-    async def _create_send_task(self):
-        """Create the audio sending task if it doesn't exist."""
-        if not self._send_task:
-            self._queue = asyncio.Queue()
-            self._send_task = self.create_task(self._send_task_handler())
-
-    async def _cancel_send_task(self):
-        """Cancel the audio sending task if it exists."""
-        if self._send_task:
-            await self.cancel_task(self._send_task)
-            self._send_task = None
-
-    async def _handle_audio_frame(self, frame: OutputAudioRawFrame):
-        """Queue an audio frame for sending."""
-        await self._queue.put(frame)
-
-    async def _send_task_handler(self):
-        """Accumulate audio into chunks and send via conversation.echo.
-
-        Tracks inference_id from the first TTSAudioRawFrame of each utterance.
-        Accumulates resampled audio until 400ms is reached, then sends with done=False.
-        On AVATAR_VAD_STOP_SECS timeout, flushes any remainder and sends a done=True
-        silence to signal end of utterance.
-        """
-        sample_rate = self._client.out_sample_rate
-        audio_chunk_bytes = int(sample_rate * 2 * 0.4)  # 400ms, 16-bit mono
-        done_silence = bytes(int(sample_rate * 2 / 20))  # 50ms silence for done signal
-        audio_buffer = bytearray()
-        inference_id: str | None = None
-        while True:
-            try:
-                frame = await asyncio.wait_for(self._queue.get(), timeout=AVATAR_VAD_STOP_SECS)
-                if inference_id is None:
-                    inference_id = str(frame.id)
-                audio = await self._resampler.resample(
-                    frame.audio, frame.sample_rate, sample_rate
-                )
-                audio_buffer.extend(audio)
-                while len(audio_buffer) >= audio_chunk_bytes:
-                    send_chunk = bytes(audio_buffer[:audio_chunk_bytes])
-                    del audio_buffer[:audio_chunk_bytes]
-                    await self._client.encode_audio_and_send(send_chunk, False, inference_id)
-                self._queue.task_done()
-            except TimeoutError:
-                if not inference_id:
-                    # nothing to do here, we're waiting for the first audio frame
-                    continue
-                if audio_buffer:
-                    await self._client.encode_audio_and_send(
-                        bytes(audio_buffer), False, inference_id
-                    )
-                    audio_buffer.clear()
-                await self._client.encode_audio_and_send(done_silence, True, inference_id)
-                inference_id = None

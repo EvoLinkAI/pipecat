@@ -26,7 +26,6 @@ from pydantic import BaseModel
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     BotConnectedFrame,
-    BotStartedSpeakingFrame,
     CancelFrame,
     ClientConnectedFrame,
     EndFrame,
@@ -208,6 +207,10 @@ class TavusTransportClient:
         self._client: DailyTransportClient | None = None
         self._callbacks = callbacks
         self._params = params
+        self._task_manager = None
+        self._resampler = create_stream_resampler()
+        self._audio_queue: asyncio.Queue | None = None
+        self._send_task = None
 
     async def _initialize(self) -> str:
         """Initialize the conversation and return the room URL."""
@@ -221,6 +224,7 @@ class TavusTransportClient:
         Args:
             setup: The frame processor setup configuration.
         """
+        self._task_manager = setup.task_manager
         if self._conversation_id is not None:
             logger.debug(f"Conversation ID already defined: {self._conversation_id}")
             return
@@ -432,6 +436,73 @@ class TavusTransportClient:
         )
         await self.send_message(transport_frame)
 
+    async def start_send_task(self) -> None:
+        """Start the audio accumulation and send task."""
+        if not self._send_task:
+            self._audio_queue = asyncio.Queue()
+            self._send_task = self._task_manager.create_task(
+                self._send_task_handler(), "TavusTransportClient::send_task"
+            )
+
+    async def cancel_send_task(self) -> None:
+        """Cancel the send task and discard any buffered audio."""
+        if self._send_task:
+            await self._task_manager.cancel_task(self._send_task)
+            self._send_task = None
+            self._audio_queue = None
+
+    async def queue_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        """Add an audio frame to the send queue.
+
+        Args:
+            frame: The audio frame to queue.
+
+        Returns:
+            True if the frame was queued, False if the queue is not active.
+        """
+        if self._audio_queue is None:
+            return False
+        await self._audio_queue.put(frame)
+        return True
+
+    async def _send_task_handler(self) -> None:
+        """Accumulate audio into chunks and send via conversation.echo.
+
+        Derives inference_id from the first frame of each utterance. Accumulates
+        resampled audio until 400ms is reached, then sends with done=False.
+        On AVATAR_VAD_STOP_SECS timeout, flushes any remainder and sends a done=True
+        silence to signal end of utterance.
+        """
+        sample_rate = self.out_sample_rate
+        audio_chunk_bytes = int(sample_rate * 2 * 0.4)  # 400ms, 16-bit mono
+        done_silence = bytes(int(sample_rate * 2 / 20))  # 50ms silence for done signal
+        audio_buffer = bytearray()
+        inference_id: str | None = None
+        while True:
+            try:
+                frame = await asyncio.wait_for(
+                    self._audio_queue.get(), timeout=AVATAR_VAD_STOP_SECS
+                )
+                if inference_id is None:
+                    inference_id = str(frame.id)
+                audio = frame.audio
+                if frame.sample_rate != sample_rate:
+                    audio = await self._resampler.resample(audio, frame.sample_rate, sample_rate)
+                audio_buffer.extend(audio)
+                while len(audio_buffer) >= audio_chunk_bytes:
+                    chunk = bytes(audio_buffer[:audio_chunk_bytes])
+                    del audio_buffer[:audio_chunk_bytes]
+                    await self.encode_audio_and_send(chunk, False, inference_id)
+                self._audio_queue.task_done()
+            except TimeoutError:
+                if not inference_id:
+                    continue
+                if audio_buffer:
+                    await self.encode_audio_and_send(bytes(audio_buffer), False, inference_id)
+                    audio_buffer.clear()
+                await self.encode_audio_and_send(done_silence, True, inference_id)
+                inference_id = None
+
     async def update_subscriptions(self, participant_settings=None, profile_settings=None):
         """Update subscription settings for participants.
 
@@ -586,13 +657,9 @@ class TavusOutputTransport(BaseOutputTransport):
         super().__init__(params, **kwargs)
         self._client = client
         self._params = params
-        self._resampler = create_stream_resampler()
 
         # Whether we have seen a StartFrame already.
         self._initialized = False
-        self._audio_queue: asyncio.Queue | None = None
-        self._send_task: asyncio.Task | None = None
-        self._inference_id: str | None = None
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the output transport.
@@ -608,18 +675,6 @@ class TavusOutputTransport(BaseOutputTransport):
         await super().cleanup()
         await self._client.cleanup()
 
-    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
-        """Intercept BotStartedSpeakingFrame to capture the inference ID."""
-        # The BotStartedSpeakingFrame and BotStoppedSpeakingFrame are created inside BaseOutputTransport
-        # so TavusOutputTransport never receives these frames.
-        # This is a workaround, so we can more reliably be aware when the bot has started or stopped speaking
-        if direction == FrameDirection.DOWNSTREAM:
-            if isinstance(frame, BotStartedSpeakingFrame):
-                if self._inference_id is not None:
-                    logger.warning("TavusOutputTransport self._current_idx_str is already defined!")
-                self._inference_id = str(frame.id)
-        await super().push_frame(frame, direction)
-
     async def start(self, frame: StartFrame):
         """Start the output transport.
 
@@ -634,8 +689,7 @@ class TavusOutputTransport(BaseOutputTransport):
         self._initialized = True
 
         await self._client.start(frame)
-
-        await self._create_send_task()
+        await self._client.start_send_task()
         await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
@@ -644,7 +698,7 @@ class TavusOutputTransport(BaseOutputTransport):
         Args:
             frame: The end frame signaling transport shutdown.
         """
-        await self._cancel_send_task()
+        await self._client.cancel_send_task()
         await super().stop(frame)
         await self._client.stop()
 
@@ -654,7 +708,7 @@ class TavusOutputTransport(BaseOutputTransport):
         Args:
             frame: The cancel frame signaling immediate cancellation.
         """
-        await self._cancel_send_task()
+        await self._client.cancel_send_task()
         await super().cancel(frame)
         await self._client.stop()
 
@@ -682,9 +736,9 @@ class TavusOutputTransport(BaseOutputTransport):
 
     async def _handle_interruptions(self):
         """Handle interruption events by discarding buffered audio and sending interrupt message."""
-        await self._cancel_send_task()
+        await self._client.cancel_send_task()
         await self._client.send_interrupt_message()
-        await self._create_send_task()
+        await self._client.start_send_task()
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         """Queue an audio frame for sending via app message.
@@ -693,64 +747,9 @@ class TavusOutputTransport(BaseOutputTransport):
             frame: The audio frame to write.
 
         Returns:
-            True if the audio frame was queued successfully, False otherwise.
+            True if the frame was queued, False if the queue is not active.
         """
-        if self._audio_queue is None:
-            return False
-        await self._audio_queue.put(frame)
-        return True
-
-    async def _create_send_task(self):
-        """Create the audio send task if it doesn't exist."""
-        if not self._send_task:
-            self._audio_queue = asyncio.Queue()
-            self._send_task = self.create_task(self._send_task_handler())
-
-    async def _cancel_send_task(self):
-        """Cancel the audio send task and discard any buffered audio."""
-        if self._send_task:
-            await self.cancel_task(self._send_task)
-            self._send_task = None
-            self._audio_queue = None
-
-    async def _send_task_handler(self):
-        """Drain the audio queue, accumulate into chunks, and send via conversation.echo.
-
-        Accumulates frames until 400ms worth of audio is reached, then sends with
-        done=False. On AVATAR_VAD_STOP_SECS timeout (end of speech), flushes any
-        remainder and sends a done=True silence to signal the utterance is complete.
-        """
-        sample_rate = self._client.out_sample_rate
-        audio_chunk_bytes = int(sample_rate * 2 * 0.4)  # 400ms, 16-bit mono
-        done_silence = bytes(int(sample_rate * 2 / 20))  # 50ms silence for done signal
-        audio_buffer = bytearray()
-        while True:
-            try:
-                frame = await asyncio.wait_for(
-                    self._audio_queue.get(), timeout=AVATAR_VAD_STOP_SECS
-                )
-                audio = frame.audio
-                if frame.sample_rate != sample_rate:
-                    audio = await self._resampler.resample(
-                        audio, frame.sample_rate, sample_rate
-                    )
-                audio_buffer.extend(audio)
-                while len(audio_buffer) >= audio_chunk_bytes:
-                    chunk = bytes(audio_buffer[:audio_chunk_bytes])
-                    del audio_buffer[:audio_chunk_bytes]
-                    await self._client.encode_audio_and_send(chunk, False, self._inference_id)
-                self._audio_queue.task_done()
-            except TimeoutError:
-                if not self._inference_id:
-                    # nothing to do here, we're waiting for the first audio frame
-                    continue
-                if audio_buffer:
-                    await self._client.encode_audio_and_send(
-                        bytes(audio_buffer), False, self._inference_id
-                    )
-                    audio_buffer.clear()
-                await self._client.encode_audio_and_send(done_silence, True, self._inference_id)
-                self._inference_id = None
+        return await self._client.queue_audio_frame(frame)
 
 
 class TavusTransport(BaseTransport):
