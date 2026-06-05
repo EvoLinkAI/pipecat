@@ -38,6 +38,7 @@ from pipecat.services.settings import ServiceSettings
 from pipecat.transports.tavus.transport import (
     AVATAR_VAD_STOP_SECS,
     TAVUS_AUDIO_CHUNK_BYTES,
+    TAVUS_DONE_SILENCE_BYTES,
     TAVUS_SAMPLE_RATE,
     TavusCallbacks,
     TavusParams,
@@ -73,7 +74,7 @@ class TavusVideoService(AIService):
         *,
         api_key: str,
         replica_id: str,
-        persona_id: str = "pipecat-stream",
+        persona_id: str = "pipecat0",
         session: aiohttp.ClientSession,
         settings: Settings | None = None,
         **kwargs,
@@ -128,8 +129,6 @@ class TavusVideoService(AIService):
             params=TavusParams(
                 audio_in_enabled=True,
                 video_in_enabled=True,
-                audio_out_enabled=True,
-                microphone_out_enabled=False,
             ),
         )
         await self._client.setup(setup)
@@ -287,27 +286,42 @@ class TavusVideoService(AIService):
             self._send_task = None
 
     async def _handle_audio_frame(self, frame: OutputAudioRawFrame):
-        """Resample audio to TAVUS_SAMPLE_RATE and queue raw bytes for sending."""
-        audio = await self._resampler.resample(frame.audio, frame.sample_rate, TAVUS_SAMPLE_RATE)
-        await self._queue.put(bytes(audio))
+        """Queue an audio frame for sending."""
+        await self._queue.put(frame)
 
     async def _send_task_handler(self):
-        """Accumulate audio into chunks and send via app message.
+        """Accumulate audio into chunks and send via conversation.echo.
 
-        Accumulates queued bytes until TAVUS_AUDIO_CHUNK_BYTES is reached, then
-        sends. On AVATAR_VAD_STOP_SECS timeout (end of speech), flushes any remainder.
+        Tracks inference_id from the first TTSAudioRawFrame of each utterance.
+        Accumulates resampled audio until TAVUS_AUDIO_CHUNK_BYTES is reached,
+        then sends with done=False. On AVATAR_VAD_STOP_SECS timeout, flushes any
+        remainder and sends a done=True silence to signal end of utterance.
         """
         audio_buffer = bytearray()
+        inference_id: str | None = None
         while True:
             try:
-                chunk = await asyncio.wait_for(self._queue.get(), timeout=AVATAR_VAD_STOP_SECS)
-                audio_buffer.extend(chunk)
+                frame = await asyncio.wait_for(self._queue.get(), timeout=AVATAR_VAD_STOP_SECS)
+                if inference_id is None:
+                    inference_id = str(frame.id)
+                audio = await self._resampler.resample(
+                    frame.audio, frame.sample_rate, TAVUS_SAMPLE_RATE
+                )
+                audio_buffer.extend(audio)
                 while len(audio_buffer) >= TAVUS_AUDIO_CHUNK_BYTES:
                     send_chunk = bytes(audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES])
                     del audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES]
-                    await self._client.send_audio_message(send_chunk)
+                    await self._client.encode_audio_and_send(send_chunk, False, inference_id)
                 self._queue.task_done()
             except TimeoutError:
+                if not inference_id:
+                    # nothing to do here, we're waiting for the first audio frame
+                    continue
                 if audio_buffer:
-                    await self._client.send_audio_message(bytes(audio_buffer))
+                    await self._client.encode_audio_and_send(
+                        bytes(audio_buffer), False, inference_id
+                    )
                     audio_buffer.clear()
+                silence = bytes(TAVUS_DONE_SILENCE_BYTES)
+                await self._client.encode_audio_and_send(silence, True, inference_id)
+                inference_id = None

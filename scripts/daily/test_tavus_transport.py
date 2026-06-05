@@ -177,12 +177,18 @@ class DailyProxyApp(EventHandler):
         if not isinstance(message, dict):
             return
         event = message.get("event_type")
-        if event == "conversation.audio":
+        if event == "conversation.echo":
+            props = message.get("properties", {})
+            if props.get("modality") != "audio":
+                return
             try:
-                audio_bytes = base64.b64decode(message["data"])
+                audio_bytes = base64.b64decode(props["audio"])
                 self._msg_count += 1
                 self._msg_bytes += len(audio_bytes)
+                done = props.get("done", False)
                 asyncio.run_coroutine_threadsafe(self._buffer_audio(audio_bytes), self._loop)
+                if done:
+                    logger.debug(f"inference {props.get('inference_id')} done")
             except Exception as e:
                 logger.error(f"Error decoding audio message: {e}")
         elif event == "conversation.interrupt":
