@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     BotConnectedFrame,
+    BotStoppedSpeakingFrame,
     CancelFrame,
     ClientConnectedFrame,
     EndFrame,
@@ -36,18 +37,17 @@ from pipecat.frames.frames import (
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
     StartFrame,
+    TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.transports.base_input import BaseInputTransport
-from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.transports.base_output import BOT_VAD_STOP_FALLBACK_SECS, BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import (
     DailyCallbacks,
     DailyParams,
     DailyTransportClient,
 )
-
-AVATAR_VAD_STOP_SECS = 0.35
 
 
 class TavusApi:
@@ -183,7 +183,7 @@ class TavusTransportClient:
         callbacks: TavusCallbacks,
         api_key: str,
         replica_id: str,
-        persona_id: str = "pipecat0",  # test with pipecat0
+        persona_id: str = "pipecat0",
         session: aiohttp.ClientSession,
     ) -> None:
         """Initialize the Tavus transport client.
@@ -451,11 +451,11 @@ class TavusTransportClient:
             self._send_task = None
             self._audio_queue = None
 
-    async def queue_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Add an audio frame to the send queue.
+    async def queue_tts_frame(self, frame: OutputAudioRawFrame | TTSStoppedFrame) -> bool:
+        """Add an audio frame or end-of-utterance signal to the send queue.
 
         Args:
-            frame: The audio frame to queue.
+            frame: An audio frame, or TTSStoppedFrame signalling end of utterance.
 
         Returns:
             True if the frame was queued, False if the queue is not active.
@@ -470,8 +470,9 @@ class TavusTransportClient:
 
         Derives inference_id from the first frame of each utterance. Accumulates
         resampled audio until 400ms is reached, then sends with done=False.
-        On AVATAR_VAD_STOP_SECS timeout, flushes any remainder and sends a done=True
-        silence to signal end of utterance.
+        Primary end-of-utterance signal: TTSStoppedFrame in the queue (queued by
+        TavusOutputTransport on BotStoppedSpeakingFrame, or by TavusVideoService on
+        TTSStoppedFrame). Fallback: BOT_VAD_STOP_FALLBACK_SECS timeout.
         """
         sample_rate = self.out_sample_rate
         audio_chunk_bytes = int(sample_rate * 2 * 0.4)  # 400ms, 16-bit mono
@@ -481,20 +482,34 @@ class TavusTransportClient:
         while True:
             try:
                 frame = await asyncio.wait_for(
-                    self._audio_queue.get(), timeout=AVATAR_VAD_STOP_SECS
+                    self._audio_queue.get(), timeout=BOT_VAD_STOP_FALLBACK_SECS
                 )
-                if inference_id is None:
-                    inference_id = str(frame.id)
-                audio = frame.audio
-                if frame.sample_rate != sample_rate:
-                    audio = await self._resampler.resample(audio, frame.sample_rate, sample_rate)
-                audio_buffer.extend(audio)
-                while len(audio_buffer) >= audio_chunk_bytes:
-                    chunk = bytes(audio_buffer[:audio_chunk_bytes])
-                    del audio_buffer[:audio_chunk_bytes]
-                    await self.encode_audio_and_send(chunk, False, inference_id)
+                if isinstance(frame, TTSStoppedFrame):
+                    # Primary end-of-utterance signal — flush and mark done.
+                    if inference_id:
+                        if audio_buffer:
+                            await self.encode_audio_and_send(
+                                bytes(audio_buffer), False, inference_id
+                            )
+                            audio_buffer.clear()
+                        await self.encode_audio_and_send(done_silence, True, inference_id)
+                        inference_id = None
+                else:
+                    if inference_id is None:
+                        inference_id = str(frame.id)
+                    audio = frame.audio
+                    if frame.sample_rate != sample_rate:
+                        audio = await self._resampler.resample(
+                            audio, frame.sample_rate, sample_rate
+                        )
+                    audio_buffer.extend(audio)
+                    while len(audio_buffer) >= audio_chunk_bytes:
+                        chunk = bytes(audio_buffer[:audio_chunk_bytes])
+                        del audio_buffer[:audio_chunk_bytes]
+                        await self.encode_audio_and_send(chunk, False, inference_id)
                 self._audio_queue.task_done()
             except TimeoutError:
+                # Fallback: no frames received — flush if mid-utterance.
                 if not inference_id:
                     continue
                 if audio_buffer:
@@ -675,6 +690,15 @@ class TavusOutputTransport(BaseOutputTransport):
         await super().cleanup()
         await self._client.cleanup()
 
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Queue a TTSStoppedFrame sentinel when bot stops speaking."""
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, BotStoppedSpeakingFrame):
+            # Handle BotStoppedSpeakingFrame because, by the time it is received, the base output transport
+            # has already sent all audio frames via write_audio_frame(). At this point it is safe to inject
+            # the TTSStoppedFrame.
+            await self._client.queue_tts_frame(TTSStoppedFrame())
+        await super().push_frame(frame, direction)
+
     async def start(self, frame: StartFrame):
         """Start the output transport.
 
@@ -748,7 +772,7 @@ class TavusOutputTransport(BaseOutputTransport):
         Returns:
             True if the frame was queued, False if the queue is not active.
         """
-        return await self._client.queue_audio_frame(frame)
+        return await self._client.queue_tts_frame(frame)
 
 
 class TavusTransport(BaseTransport):
