@@ -47,6 +47,8 @@ class DailyProxyApp(EventHandler):
         # Raw PCM buffer — filled by app-message audio, drained at SAMPLE_RATE speed.
         self._buffer = bytearray()
         self._audio_task: asyncio.Task | None = None
+        self._msg_count = 0
+        self._msg_bytes = 0
 
         self._client: CallClient = CallClient(event_handler=self)
         self._client.update_subscription_profiles(
@@ -158,10 +160,13 @@ class DailyProxyApp(EventHandler):
             now = self._loop.time()
             if now - last_log_time >= 1.0:
                 buffer_seconds = len(self._buffer) / (SAMPLE_RATE * 2)
-                if buffer_seconds > 0:
-                    logger.info(
-                        f"Buffer status: {len(self._buffer)}B ({buffer_seconds:.3f}s buffered)"
-                    )
+                logger.info(
+                    f"msgs/s: {self._msg_count} | "
+                    f"KB/s: {self._msg_bytes / 1024:.1f} | "
+                    f"buffered: {buffer_seconds:.3f}s"
+                )
+                self._msg_count = 0
+                self._msg_bytes = 0
                 last_log_time = now
 
     #
@@ -175,6 +180,8 @@ class DailyProxyApp(EventHandler):
         if event == "conversation.audio":
             try:
                 audio_bytes = base64.b64decode(message["data"])
+                self._msg_count += 1
+                self._msg_bytes += len(audio_bytes)
                 asyncio.run_coroutine_threadsafe(self._buffer_audio(audio_bytes), self._loop)
             except Exception as e:
                 logger.error(f"Error decoding audio message: {e}")
