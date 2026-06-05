@@ -35,7 +35,14 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.ai_service import AIService
 from pipecat.services.settings import ServiceSettings
-from pipecat.transports.tavus.transport import TavusCallbacks, TavusParams, TavusTransportClient
+from pipecat.transports.tavus.transport import (
+    AVATAR_VAD_STOP_SECS,
+    TAVUS_AUDIO_CHUNK_BYTES,
+    TAVUS_SAMPLE_RATE,
+    TavusCallbacks,
+    TavusParams,
+    TavusTransportClient,
+)
 
 
 @dataclass
@@ -95,13 +102,8 @@ class TavusVideoService(AIService):
         self._other_participant_has_joined = False
         self._client: TavusTransportClient | None = None
 
-        self._conversation_id: str
         self._resampler = create_stream_resampler()
-
-        self._audio_buffer = bytearray()
         self._send_task: asyncio.Task | None = None
-        # This is the custom track destination expected by Tavus
-        self._transport_destination: str | None = "stream"
         self._transport_ready = False
 
     async def setup(self, setup: FrameProcessorSetup):
@@ -212,10 +214,6 @@ class TavusVideoService(AIService):
         """
         await super().start(frame)
         await self._client.start(frame)
-        if self._transport_destination:
-            await self._client.register_audio_destination(
-                self._transport_destination, auto_silence=False
-            )
         await self._create_send_task()
 
     async def stop(self, frame: EndFrame):
@@ -289,28 +287,27 @@ class TavusVideoService(AIService):
             self._send_task = None
 
     async def _handle_audio_frame(self, frame: OutputAudioRawFrame):
-        """Process audio frames for sending to Tavus."""
-        sample_rate = self._client.out_sample_rate
-        # 40 ms of audio
-        chunk_size = int((sample_rate * 2) / 25)
-        # We might need to resample if incoming audio doesn't match the
-        # transport sample rate.
-        resampled = await self._resampler.resample(frame.audio, frame.sample_rate, sample_rate)
-        self._audio_buffer.extend(resampled)
-        while len(self._audio_buffer) >= chunk_size:
-            chunk = OutputAudioRawFrame(
-                bytes(self._audio_buffer[:chunk_size]),
-                sample_rate=sample_rate,
-                num_channels=frame.num_channels,
-            )
-            chunk.transport_destination = self._transport_destination
-            await self._queue.put(chunk)
-            self._audio_buffer = self._audio_buffer[chunk_size:]
+        """Resample audio to TAVUS_SAMPLE_RATE and queue raw bytes for sending."""
+        audio = await self._resampler.resample(frame.audio, frame.sample_rate, TAVUS_SAMPLE_RATE)
+        await self._queue.put(bytes(audio))
 
     async def _send_task_handler(self):
-        """Handle sending audio frames to the Tavus client."""
+        """Accumulate audio into chunks and send via app message.
+
+        Accumulates queued bytes until TAVUS_AUDIO_CHUNK_BYTES is reached, then
+        sends. On AVATAR_VAD_STOP_SECS timeout (end of speech), flushes any remainder.
+        """
+        audio_buffer = bytearray()
         while True:
-            frame = await self._queue.get()
-            if isinstance(frame, OutputAudioRawFrame) and self._client:
-                await self._client.write_audio_frame(frame)
-            self._queue.task_done()
+            try:
+                chunk = await asyncio.wait_for(self._queue.get(), timeout=AVATAR_VAD_STOP_SECS)
+                audio_buffer.extend(chunk)
+                while len(audio_buffer) >= TAVUS_AUDIO_CHUNK_BYTES:
+                    send_chunk = bytes(audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES])
+                    del audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES]
+                    await self._client.send_audio_message(send_chunk)
+                self._queue.task_done()
+            except TimeoutError:
+                if audio_buffer:
+                    await self._client.send_audio_message(bytes(audio_buffer))
+                    audio_buffer.clear()

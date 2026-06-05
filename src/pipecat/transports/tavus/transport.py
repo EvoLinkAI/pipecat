@@ -11,6 +11,8 @@ AI applications with avatars. It manages conversation sessions and provides real
 audio/video streaming capabilities through the Tavus API.
 """
 
+import asyncio
+import base64
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from functools import partial
@@ -21,6 +23,7 @@ from daily.daily import AudioData
 from loguru import logger
 from pydantic import BaseModel
 
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     BotConnectedFrame,
     CancelFrame,
@@ -43,6 +46,10 @@ from pipecat.transports.daily.transport import (
     DailyParams,
     DailyTransportClient,
 )
+
+TAVUS_SAMPLE_RATE = 24000
+TAVUS_AUDIO_CHUNK_BYTES = int(TAVUS_SAMPLE_RATE * 2 * 0.4)  # 400ms, 16-bit mono
+AVATAR_VAD_STOP_SECS = 0.35
 
 
 class TavusApi:
@@ -178,7 +185,7 @@ class TavusTransportClient:
         callbacks: TavusCallbacks,
         api_key: str,
         replica_id: str,
-        persona_id: str = "pipecat-stream",
+        persona_id: str = "pipecat0", # test with pipecat0
         session: aiohttp.ClientSession,
     ) -> None:
         """Initialize the Tavus transport client.
@@ -272,6 +279,11 @@ class TavusTransportClient:
             await self._client.cleanup()
         except Exception as e:
             logger.error(f"Exception during cleanup: {e}")
+
+    @property
+    def conversation_id(self) -> str | None:
+        """Get the current conversation ID."""
+        return self._conversation_id
 
     async def _on_joined(self, data):
         """Handle joined event."""
@@ -390,6 +402,25 @@ class TavusTransportClient:
                 "message_type": "conversation",
                 "event_type": "conversation.interrupt",
                 "conversation_id": self._conversation_id,
+            }
+        )
+        await self.send_message(transport_frame)
+
+    async def send_audio_message(self, audio: bytes) -> None:
+        """Base64-encode audio bytes and send as a Daily app message.
+
+        Args:
+            audio: Raw PCM bytes at TAVUS_SAMPLE_RATE, 16-bit mono.
+        """
+        encoded = base64.b64encode(audio).decode("utf-8")
+        transport_frame = OutputTransportMessageFrame(
+            message={
+                "message_type": "conversation",
+                "event_type": "conversation.audio",
+                "conversation_id": self._conversation_id,
+                "data": encoded,
+                "sample_rate": TAVUS_SAMPLE_RATE,
+                "num_channels": 1,
             }
         )
         await self.send_message(transport_frame)
@@ -562,11 +593,12 @@ class TavusOutputTransport(BaseOutputTransport):
         super().__init__(params, **kwargs)
         self._client = client
         self._params = params
+        self._resampler = create_stream_resampler()
 
         # Whether we have seen a StartFrame already.
         self._initialized = False
-        # This is the custom track destination expected by Tavus
-        self._transport_destination: str | None = "stream"
+        self._audio_queue: asyncio.Queue | None = None
+        self._send_task: asyncio.Task | None = None
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the output transport.
@@ -597,9 +629,7 @@ class TavusOutputTransport(BaseOutputTransport):
 
         await self._client.start(frame)
 
-        if self._transport_destination:
-            await self._client.register_audio_destination(self._transport_destination)
-
+        await self._create_send_task()
         await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
@@ -608,6 +638,7 @@ class TavusOutputTransport(BaseOutputTransport):
         Args:
             frame: The end frame signaling transport shutdown.
         """
+        await self._cancel_send_task()
         await super().stop(frame)
         await self._client.stop()
 
@@ -617,6 +648,7 @@ class TavusOutputTransport(BaseOutputTransport):
         Args:
             frame: The cancel frame signaling immediate cancellation.
         """
+        await self._cancel_send_task()
         await super().cancel(frame)
         await self._client.stop()
 
@@ -643,29 +675,65 @@ class TavusOutputTransport(BaseOutputTransport):
             await self._handle_interruptions()
 
     async def _handle_interruptions(self):
-        """Handle interruption events by sending interrupt message."""
+        """Handle interruption events by discarding buffered audio and sending interrupt message."""
+        await self._cancel_send_task()
         await self._client.send_interrupt_message()
+        await self._create_send_task()
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Write an audio frame to the Tavus transport.
+        """Queue an audio frame for sending via app message.
 
         Args:
             frame: The audio frame to write.
 
         Returns:
-            True if the audio frame was written successfully, False otherwise.
+            True if the audio frame was queued successfully, False otherwise.
         """
-        # This is the custom track destination expected by Tavus
-        frame.transport_destination = self._transport_destination
-        return await self._client.write_audio_frame(frame)
+        if self._audio_queue is None:
+            return False
+        await self._audio_queue.put(frame)
+        return True
 
-    async def register_audio_destination(self, destination: str):
-        """Register an audio destination.
+    async def _create_send_task(self):
+        """Create the audio send task if it doesn't exist."""
+        if not self._send_task:
+            self._audio_queue = asyncio.Queue()
+            self._send_task = self.create_task(self._send_task_handler())
 
-        Args:
-            destination: The destination identifier to register.
+    async def _cancel_send_task(self):
+        """Cancel the audio send task and discard any buffered audio."""
+        if self._send_task:
+            await self.cancel_task(self._send_task)
+            self._send_task = None
+            self._audio_queue = None
+
+    async def _send_task_handler(self):
+        """Drain the audio queue, accumulate into chunks, and send via app message.
+
+        Accumulates frames until TAVUS_AUDIO_CHUNK_BYTES is reached, then sends.
+        On AVATAR_VAD_STOP_SECS timeout (end of speech), flushes any remainder.
         """
-        await self._client.register_audio_destination(destination)
+        audio_buffer = bytearray()
+        while True:
+            try:
+                frame = await asyncio.wait_for(
+                    self._audio_queue.get(), timeout=AVATAR_VAD_STOP_SECS
+                )
+                audio = frame.audio
+                if frame.sample_rate != TAVUS_SAMPLE_RATE:
+                    audio = await self._resampler.resample(
+                        audio, frame.sample_rate, TAVUS_SAMPLE_RATE
+                    )
+                audio_buffer.extend(audio)
+                while len(audio_buffer) >= TAVUS_AUDIO_CHUNK_BYTES:
+                    chunk = bytes(audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES])
+                    del audio_buffer[:TAVUS_AUDIO_CHUNK_BYTES]
+                    await self._client.send_audio_message(chunk)
+                self._audio_queue.task_done()
+            except TimeoutError:
+                if audio_buffer:
+                    await self._client.send_audio_message(bytes(audio_buffer))
+                    audio_buffer.clear()
 
 
 class TavusTransport(BaseTransport):
