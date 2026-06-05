@@ -720,7 +720,6 @@ class TavusOutputTransport(BaseOutputTransport):
         Args:
             frame: The message frame to send.
         """
-        logger.info(f"TavusOutputTransport sending message {frame}")
         await self._client.send_message(frame)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
