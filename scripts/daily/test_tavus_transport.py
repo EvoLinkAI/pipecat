@@ -1,9 +1,11 @@
 import asyncio
+import base64
+import datetime
 import os
 import signal
+import wave
 
 from daily import (
-    AudioData,
     CallClient,
     CustomAudioSource,
     CustomAudioTrack,
@@ -14,6 +16,10 @@ from dotenv import load_dotenv
 from loguru import logger
 
 load_dotenv(override=True)
+
+SAMPLE_RATE = 24000
+CHUNK_BYTES = int(SAMPLE_RATE * 20 / 1000) * 2  # 20ms, 16-bit mono
+MIN_AUDIO_BUFFER = CHUNK_BYTES * 5  # 100ms pre-buffer
 
 
 def completion_callback(future):
@@ -37,19 +43,21 @@ class DailyProxyApp(EventHandler):
     def __new__(cls, *args, **kwargs):
         return super().__new__(cls)
 
-    def __init__(self, sample_rate: int):
+    def __init__(self):
         super().__init__()
-        self._sample_rate = sample_rate
         self._loop = asyncio.new_event_loop()
-        self._audio_queue: asyncio.Queue = asyncio.Queue()
+        # Raw PCM buffer — filled by app-message audio, drained at SAMPLE_RATE speed.
+        self._buffer = bytearray()
         self._audio_task: asyncio.Task | None = None
+        self._wav_file: wave.Wave_write | None = None
 
         self._client: CallClient = CallClient(event_handler=self)
         self._client.update_subscription_profiles(
-            {"base": {"camera": "unsubscribed", "microphone": "subscribed"}}
+            {"base": {"camera": "unsubscribed", "microphone": "unsubscribed"}}
         )
 
-        self._audio_source = CustomAudioSource(self._sample_rate, 1)
+        # Playback source at SAMPLE_RATE — consumes audio at real-time speed.
+        self._audio_source = CustomAudioSource(SAMPLE_RATE, 1, False)
         self._audio_track = CustomAudioTrack(self._audio_source)
 
     def on_joined(self, data, error):
@@ -58,8 +66,24 @@ class DailyProxyApp(EventHandler):
             print(f"Unable to join meeting: {error}")
             self._loop.call_soon_threadsafe(self._loop.stop)
 
+    def _open_wav(self):
+        os.makedirs("recordings", exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"recordings/received_appmsg_{timestamp}.wav"
+        self._wav_file = wave.open(path, "wb")
+        self._wav_file.setnchannels(1)
+        self._wav_file.setsampwidth(2)
+        self._wav_file.setframerate(SAMPLE_RATE)
+        logger.info(f"Recording received audio to {path}")
+
+    def _close_wav(self):
+        if self._wav_file:
+            self._wav_file.close()
+            self._wav_file = None
+
     def run(self, meeting_url: str):
         asyncio.set_event_loop(self._loop)
+        self._open_wav()
         self._create_audio_task()
 
         def handle_exit():
@@ -92,18 +116,9 @@ class DailyProxyApp(EventHandler):
         if self._audio_task:
             self._loop.run_until_complete(self._cancel_audio_task())
 
+        self._close_wav()
         self._client.leave()
         self._client.release()
-
-    async def update_subscriptions(self, participant_settings=None, profile_settings=None):
-        logger.info(f"Updating subscriptions participant_settings: {participant_settings}")
-        future = asyncio.get_running_loop().create_future()
-        self._client.update_subscriptions(
-            participant_settings=participant_settings,
-            profile_settings=profile_settings,
-            completion=completion_callback(future),
-        )
-        await future
 
     def _create_audio_task(self):
         if not self._audio_task:
@@ -113,58 +128,84 @@ class DailyProxyApp(EventHandler):
         if self._audio_task:
             self._audio_task.cancel()
             try:
-                # Waits for it to finish
                 await self._audio_task
             except asyncio.CancelledError:
                 pass
             self._audio_task = None
 
-    async def capture_participant_audio(self, participant_id: str):
-        logger.info(f"Capturing participant audio: {participant_id}")
-        # Receiving from this custom track
-        # audio_source: str = "microphone"
-        audio_source: str = "stream"
-        media = {"media": {"customAudio": {audio_source: "subscribed"}}}
-        await self.update_subscriptions(participant_settings={participant_id: media})
+    async def _buffer_audio(self, data: bytes):
+        """Append decoded audio bytes to the buffer."""
+        self._buffer.extend(data)
 
-        self._client.set_audio_renderer(
-            participant_id,
-            self._audio_data_received,
-            audio_source=audio_source,
-            sample_rate=self._sample_rate,
-            callback_interval_ms=20,
+    async def _handle_interrupt(self):
+        """Clear the audio buffer, mimicking the avatar stopping mid-speech."""
+        dropped = len(self._buffer)
+        self._buffer.clear()
+        logger.info(
+            f"Interrupt received — dropped {dropped}B ({dropped / (SAMPLE_RATE * 2):.3f}s) from buffer"
         )
 
-    async def send_audio(self, audio: AudioData):
-        future = asyncio.get_running_loop().create_future()
-        self._audio_source.write_frames(audio.audio_frames, completion=completion_callback(future))
-        await future
-
-    async def queue_audio(self, audio: AudioData):
-        await self._audio_queue.put(audio)
-
-    def _audio_data_received(self, participant_id: str, audio_data: AudioData, audio_source: str):
-        # logger.info(f"Received audio data for {participant_id}, audio_source: {audio_source}")
-        asyncio.run_coroutine_threadsafe(self.queue_audio(audio_data), self._loop)
-
     async def _audio_task_handler(self):
+        """Drain the buffer at SAMPLE_RATE speed (real-time playback).
+
+        Waits until MIN_AUDIO_BUFFER bytes are accumulated before starting
+        playback, then drains in CHUNK_BYTES steps. If the buffer runs dry it
+        re-enters the waiting state so the next burst also gets the pre-buffer delay.
+        """
+        buffering = True
+        last_log_time = self._loop.time()
+
         while True:
-            audio = await self._audio_queue.get()
-            await self.send_audio(audio)
+            if buffering:
+                if len(self._buffer) >= MIN_AUDIO_BUFFER:
+                    buffering = False
+                    logger.debug(f"Pre-buffer reached ({MIN_AUDIO_BUFFER}B) — starting playback")
+                else:
+                    await asyncio.sleep(0.001)
+                    continue
+
+            if len(self._buffer) >= CHUNK_BYTES:
+                chunk = bytes(self._buffer[:CHUNK_BYTES])
+                del self._buffer[:CHUNK_BYTES]
+
+                future = asyncio.get_running_loop().create_future()
+                self._audio_source.write_frames(chunk, completion=completion_callback(future))
+                await future
+            else:
+                buffering = True
+                await asyncio.sleep(0.001)
+
+            now = self._loop.time()
+            if now - last_log_time >= 1.0:
+                buffer_seconds = len(self._buffer) / (SAMPLE_RATE * 2)
+                if buffer_seconds > 0:
+                    logger.info(
+                        f"Buffer status: {len(self._buffer)}B ({buffer_seconds:.3f}s buffered)"
+                    )
+                last_log_time = now
 
     #
     # Daily (EventHandler)
     #
 
+    def on_app_message(self, message, sender):
+        if not isinstance(message, dict):
+            return
+        event = message.get("event_type")
+        if event == "conversation.audio":
+            try:
+                audio_bytes = base64.b64decode(message["data"])
+                if self._wav_file:
+                    self._wav_file.writeframes(audio_bytes)
+                asyncio.run_coroutine_threadsafe(self._buffer_audio(audio_bytes), self._loop)
+            except Exception as e:
+                logger.error(f"Error decoding audio message: {e}")
+        elif event == "conversation.interrupt":
+            asyncio.run_coroutine_threadsafe(self._handle_interrupt(), self._loop)
+
     def on_participant_joined(self, participant):
         participant_name = participant["info"]["userName"]
         logger.info(f"Participant {participant_name} joined")
-        if participant_name != "Pipecat":
-            # We are only subscribing for audios from Pipecat.
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.capture_participant_audio(participant_id=participant["id"]), self._loop
-        )
 
     def on_participant_left(self, participant, reason):
         logger.info(f"Participant {participant['id']} left {reason}")
@@ -173,7 +214,7 @@ class DailyProxyApp(EventHandler):
 def main():
     Daily.init()
     room_url = os.environ["TAVUS_SAMPLE_ROOM_URL"]
-    app = DailyProxyApp(sample_rate=24000)
+    app = DailyProxyApp()
     app.run(room_url)
 
 
