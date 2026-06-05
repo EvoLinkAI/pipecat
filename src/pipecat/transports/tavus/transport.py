@@ -469,14 +469,14 @@ class TavusTransportClient:
         """Accumulate audio into chunks and send via conversation.echo.
 
         Derives inference_id from the first frame of each utterance. Accumulates
-        resampled audio until 400ms is reached, then sends with done=False.
+        resampled audio until 100ms is reached, then sends with done=False.
         Primary end-of-utterance signal: TTSStoppedFrame in the queue (queued by
         TavusOutputTransport on BotStoppedSpeakingFrame, or by TavusVideoService on
         TTSStoppedFrame). Fallback: BOT_VAD_STOP_FALLBACK_SECS timeout.
         """
         sample_rate = self.out_sample_rate
-        audio_chunk_bytes = int(sample_rate * 2 * 0.4)  # 400ms, 16-bit mono
-        done_silence = bytes(int(sample_rate * 2 / 20))  # 50ms silence for done signal
+        audio_chunk_bytes = int(sample_rate * 2 * 0.1)  # 100ms, 16-bit mono
+        done_silence = bytes(int(sample_rate * 2 / 25))  # 40ms silence for done signal
         audio_buffer = bytearray()
         inference_id: str | None = None
         while True:
