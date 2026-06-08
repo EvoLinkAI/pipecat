@@ -465,6 +465,18 @@ class TavusTransportClient:
         await self._audio_queue.put(frame)
         return True
 
+    async def _send_utterance_done(self, inference_id: str) -> None:
+        """Send a 40ms silence frame with done=True to close an utterance."""
+        done_silence = bytes(int(self.out_sample_rate * 2 / 25))
+        await self.encode_audio_and_send(done_silence, True, inference_id)
+
+    async def _flush_and_end_utterance(self, audio_buffer: bytearray, inference_id: str) -> None:
+        """Flush remaining buffered audio then send the done marker."""
+        if audio_buffer:
+            await self.encode_audio_and_send(bytes(audio_buffer), False, inference_id)
+            audio_buffer.clear()
+        await self._send_utterance_done(inference_id)
+
     async def _send_task_handler(self) -> None:
         """Accumulate audio into chunks and send via conversation.echo.
 
@@ -476,7 +488,6 @@ class TavusTransportClient:
         """
         sample_rate = self.out_sample_rate
         audio_chunk_bytes = int(sample_rate * 2 * 0.1)  # 100ms, 16-bit mono
-        done_silence = bytes(int(sample_rate * 2 / 25))  # 40ms silence for done signal
         audio_buffer = bytearray()
         inference_id: str | None = None
         while True:
@@ -487,12 +498,7 @@ class TavusTransportClient:
                 if isinstance(frame, TTSStoppedFrame):
                     # Primary end-of-utterance signal — flush and mark done.
                     if inference_id:
-                        if audio_buffer:
-                            await self.encode_audio_and_send(
-                                bytes(audio_buffer), False, inference_id
-                            )
-                            audio_buffer.clear()
-                        await self.encode_audio_and_send(done_silence, True, inference_id)
+                        await self._flush_and_end_utterance(audio_buffer, inference_id)
                         inference_id = None
                 else:
                     if inference_id is None:
@@ -512,10 +518,7 @@ class TavusTransportClient:
                 # Fallback: no frames received — flush if mid-utterance.
                 if not inference_id:
                     continue
-                if audio_buffer:
-                    await self.encode_audio_and_send(bytes(audio_buffer), False, inference_id)
-                    audio_buffer.clear()
-                await self.encode_audio_and_send(done_silence, True, inference_id)
+                await self._flush_and_end_utterance(audio_buffer, inference_id)
                 inference_id = None
 
     async def update_subscriptions(self, participant_settings=None, profile_settings=None):
