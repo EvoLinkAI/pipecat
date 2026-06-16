@@ -1512,6 +1512,9 @@ class TTSService(AIService):
                         await self.stop_ttfb_metrics()
                         await self.start_word_timestamps()
                         timestamps_started = True
+                    # Scan leading silence to report time-to-first-audio. This is
+                    # a no-op once the first audible sample has been found.
+                    await self.process_ttfa_metrics(frame)
 
                 if frame:
                     if isinstance(frame, TTSStartedFrame):
